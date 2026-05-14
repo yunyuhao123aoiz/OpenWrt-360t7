@@ -7,11 +7,11 @@ netmask="255.255.255.0"
 LOGFILE="/etc/config/uci-defaults-log.txt"
 
 # 设置路由器主机名
-uci set system.@system[0].hostname=$hostname
+uci set system.@system[0].hostname="$hostname"
 # 设置路由器管理后台地址
-uci set network.lan.ipaddr=$ip_address
+uci set network.lan.ipaddr="$ip_address"
 # 设置子网掩码
-uci set network.lan.netmask=$netmask
+uci set network.lan.netmask="$netmask"
 # 设置所有网口可连接 SSH
 uci set dropbear.@dropbear[0].Interface=''
 uci commit
