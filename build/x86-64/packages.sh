@@ -3,6 +3,13 @@
 
 PACKAGES="$PACKAGES fdisk"
 PACKAGES="$PACKAGES iperf3"
+# Realtek系列
+PACKAGES="$PACKAGES kmod-r8169"    # 常见的Realtek PCIe千兆网卡
+PACKAGES="$PACKAGES kmod-r8168"    # 较旧的Realtek PCIe网卡
+# Intel系列
+PACKAGES="$PACKAGES kmod-e1000"    # Intel PRO/1000系列PCI-X/PCIe网卡
+PACKAGES="$PACKAGES kmod-e1000e"   # 较新的Intel千兆网卡，常用于台式机主板
+PACKAGES="$PACKAGES kmod-igb"      # Intel服务器级千兆网卡，如I350
 
 # =========================== immortalwrt 插件 ===========================
 
@@ -40,7 +47,7 @@ PACKAGES="$PACKAGES iperf3"
 # PACKAGES="$PACKAGES luci-i18n-ddns-go-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-ddns-zh-cn"
 PACKAGES="$PACKAGES luci-i18n-diskman-zh-cn"
-PACKAGES="$PACKAGES luci-i18n-dockerman-zh-cn"
+# PACKAGES="$PACKAGES luci-i18n-dockerman-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-dsl-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-dump1090-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-dynapoint-zh-cn"
@@ -73,7 +80,7 @@ PACKAGES="$PACKAGES luci-i18n-eqos-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-mosquitto-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-msd_lite-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-music-remote-center-zh-cn"
-PACKAGES="$PACKAGES luci-i18n-mwan3-zh-cn"
+# PACKAGES="$PACKAGES luci-i18n-mwan3-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-n2n-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-natmap-zh-cn"
 # PACKAGES="$PACKAGES luci-i18n-netdata-zh-cn"

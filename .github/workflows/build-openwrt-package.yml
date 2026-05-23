@@ -259,7 +259,7 @@ jobs:
           done
 
       - name: 🔨 Build OpenWrt Packages
-        uses: immortalwrt/gh-action-sdk@master
+        uses: sbwml/openwrt-gh-action-sdk@go1.26
         env:
           ARCH: ${{ matrix.arch }}-openwrt-${{ matrix.version }}
           FEEDNAME: packages_ci
