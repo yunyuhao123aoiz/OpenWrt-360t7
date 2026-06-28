@@ -9,11 +9,7 @@ on:
         required: true
         default: all
         options:
-          - all
-          - cmcc_rax3000me
           - qihoo_360t7
-          - x86-64
-          - xiaomi_mi-router-ax3000t-ubootmod
       ip_address:
         type: string
         description: "后台IP地址(可选)"
@@ -51,6 +47,8 @@ jobs:
   call-build-package:
     uses: ./.github/workflows/build-openwrt-package.yml
     secrets: inherit
+    permissions:
+      contents: write
 
   build:
     needs:
