@@ -1,24 +1,34 @@
 #!/bin/sh
-# 该脚本为immortalwrt首次启动时 运行的脚本 即 /etc/uci-defaults/99-custom.sh 也就是说该文件在路由器内 重启后消失 只运行一次
-# 基础变量
-hostname="immortalwrt"
+# 文件: build/qihoo_360t7/99-custom.sh
+# 首次启动配置脚本
+
+# 默认值（会被工作流替换）
+hostname="yunyue"
 ip_address="192.168.1.1"
 netmask="255.255.255.0"
-LOGFILE="/etc/config/uci-defaults-log.txt"
 
-# 设置路由器主机名
-uci set system.@system[0].hostname="$hostname"
-# 设置路由器管理后台地址
-uci set network.lan.ipaddr="$ip_address"
-# 设置子网掩码
-uci set network.lan.netmask="$netmask"
-# 设置所有网口可连接 SSH
-uci set dropbear.@dropbear[0].Interface=''
-uci commit
+# 设置主机名
+if [ -n "$hostname" ]; then
+    echo "$hostname" > /proc/sys/kernel/hostname
+    uci set system.@system[0].hostname="$hostname"
+    uci commit system
+fi
 
-# 设置编译作者信息
-FILE_PATH="/etc/openwrt_release"
-NEW_DESCRIPTION="By QiYueYiya"
-sed -i "s/DISTRIB_DESCRIPTION='[^']*'/DISTRIB_DESCRIPTION='$NEW_DESCRIPTION'/" "$FILE_PATH"
+# 设置LAN IP
+if [ -n "$ip_address" ] && [ -n "$netmask" ]; then
+    uci set network.lan.ipaddr="$ip_address"
+    uci set network.lan.netmask="$netmask"
+    uci commit network
+    # 重启网络服务应用配置
+    /etc/init.d/network restart
+fi
 
+# 允许SSH从LAN访问
+uci set dropbear.@dropbear[0].Interface='lan'
+uci commit dropbear
+
+# 写入固件描述信息
+echo "ImmortalWrt $(cat /etc/openwrt_version) $(date +'%Y-%m-%d')" > /etc/banner
+
+# 清理自身 (uci-defaults会在执行后自动删除)
 exit 0
