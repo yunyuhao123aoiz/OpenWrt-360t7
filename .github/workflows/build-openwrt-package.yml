@@ -1,4 +1,4 @@
-name: Build OpenWrt Packages
+name: Build Custom Packages
 
 on:
   workflow_call:
@@ -33,9 +33,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 收集所有设备配置，提取 arch 和 version（只针对真正的设备文件夹，排除 package 等）
+          # 这里我们只查找 build/*/config.sh，但必须排除 build/package/ 这样的目录
           config_files=(build/*/config.sh)
+          # 过滤掉 build/package 目录（如果存在）
+          filtered=()
+          for f in "${config_files[@]}"; do
+            if [[ "$f" != build/package/* ]]; then
+              filtered+=("$f")
+            fi
+          done
+          config_files=("${filtered[@]}")
+
           if [ ${#config_files[@]} -eq 0 ]; then
-            echo "::error::No config.sh files found under build/"
+            echo "::error::No device config.sh files found under build/"
             exit 1
           fi
 
@@ -118,6 +129,7 @@ jobs:
             version=$(echo "$PAIRS_JSON" | jq -r ".[$idx].version")
             echo "::notice::🔎 Checking arch=$arch version=$version"
 
+            # 检查 config/extra_packages.json 是否存在
             if [ -f "config/extra_packages.json" ]; then
               while IFS= read -r entry; do
                 url=$(echo "$entry" | jq -r '.url // empty')
@@ -204,8 +216,6 @@ jobs:
           TZ='Asia/Shanghai'
           build_date=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           echo "date=$build_date" >> $GITHUB_OUTPUT
-
-      # Removed: Extract Major Version (matrix.version is already the major version)
 
       - name: 📦 Clone Extra Packages
         env:
