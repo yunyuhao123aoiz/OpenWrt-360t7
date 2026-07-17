@@ -2,25 +2,28 @@
   {
     "url": "https://github.com/JaneCCP/luci-app-adguardhome",
     "branch": "master",
-    "packages": [
-      "luci-app-adguardhome"
-    ]
+    "packages": ["luci-app-adguardhome"]
   },
   {
     "url": "https://github.com/EasyTier/luci-app-easytier",
     "branch": "main",
-    "packages": [
-      "easytier", 
-      "luci-app-easytier"
-    ],
+    "packages": ["easytier", "luci-app-easytier"],
     "scripts": "luci-app-easytier.sh"
   },
   {
     "url": "https://github.com/sbwml/luci-app-mosdns",
     "branch": "v5",
-    "packages": [
-      "luci-app-mosdns"
-    ],
+    "packages": ["luci-app-mosdns"],
     "scripts": "luci-app-mosdns.sh"
+  },
+  {
+    "url": "https://github.com/TimouL/luci-app-timecontrol.git",
+    "branch": "main",
+    "packages": ["luci-app-timecontrol", "luci-i18n-timecontrol-zh-cn"]
+  },
+  {
+    "url": "https://github.com/destan19/OpenAppFilter.git",
+    "branch": "main",
+    "packages": ["kmod-oaf", "luci-app-oaf", "luci-i18n-oaf-zh-cn"]
   }
 ]
