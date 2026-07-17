@@ -1,68 +1,202 @@
-name: Build OpenWrt Image
+name: Build OpenWrt Packages
 
 on:
+  workflow_call:
   workflow_dispatch:
-    inputs:
-      device:
-        type: choice
-        description: "选择型号"
-        required: true
-        default: all
-        options:
-          - qihoo_360t7
-      ip_address:
-        type: string
-        description: "后台IP地址(可选)"
-        required: false
+  schedule:
+    - cron: '0 0 * * *'
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
 
 jobs:
   generate-matrix:
+    name: Generate Build Matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      arches: ${{ steps.collect.outputs.arches }}
+      versions: ${{ steps.collect.outputs.versions }}
+      arch-version-pairs: ${{ steps.collect.outputs.arch_version_pairs }}
+      has-updates: ${{ steps.check-updates.outputs.has_updates }}
+      hashes-b64: ${{ steps.check-updates.outputs.hashes_b64 }}
+      updated-packages: ${{ steps.check-updates.outputs.updated_packages }}
+      updated-entries-b64: ${{ steps.check-updates.outputs.updated_entries_b64 }}
     steps:
       - name: 🛬 Checkout Repository
         uses: actions/checkout@v6
 
-      - name: 🧩 Build Matrix
-        id: set-matrix
+      - name: 🧩 Generate Matrix
+        id: collect
         run: |
-          SELECTED_DEVICE="${{ github.event.inputs.device }}"
+          set -euo pipefail
 
-          if [ "$SELECTED_DEVICE" = "all" ]; then
-            mapfile -t DEVICES < <(find build -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/config.sh' ';' -printf '%f\n' | sort)
-          else
-            DEVICES=("$SELECTED_DEVICE")
-          fi
-
-          if [ "${#DEVICES[@]}" -eq 0 ]; then
-            echo "::error::No build devices found under build/"
+          config_files=(build/*/config.sh)
+          if [ ${#config_files[@]} -eq 0 ]; then
+            echo "::error::No config.sh files found under build/"
             exit 1
           fi
 
-          MATRIX_JSON=$(printf '%s\n' "${DEVICES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({device: .}) | {include: .}')
-          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
-          echo "::notice::Build matrix: $MATRIX_JSON"
+          declare -A latest_versions
+          declare -A all_arches
 
-  call-build-package:
-    uses: ./.github/workflows/build-openwrt-package.yml
-    secrets: inherit
-    permissions:
-      contents: write
+          for file in "${config_files[@]}"; do
+            arch="$(sed -n 's/^export arch="\([^"]*\)"/\1/p' "$file" | head -n1)"
+            version="$(sed -n 's/^export version="\([^"]*\)"/\1/p' "$file" | head -n1)"
 
-  build:
-    needs:
-      - generate-matrix
-      - call-build-package
+            if [ -z "$arch" ] || [ -z "$version" ]; then
+              echo "::error::Missing arch/version in $file"
+              exit 1
+            fi
+
+            all_arches["$arch"]=1
+            major="$(echo "$version" | cut -d. -f1,2)"
+            current="${latest_versions[$major]:-}"
+            if [[ -z "$current" || "$version" > "$current" ]]; then
+              latest_versions["$major"]="$version"
+            fi
+          done
+
+          mapfile -t arches_sorted < <(printf '%s\n' "${!all_arches[@]}" | sort)
+          mapfile -t versions_sorted < <(printf '%s\n' "${!latest_versions[@]}" | sort -V)
+
+          arches_json="$(printf '%s\n' "${arches_sorted[@]}" | jq -Rsc 'split("\n")[:-1]')"
+          versions_json="$(printf '%s\n' "${versions_sorted[@]}" | jq -Rsc 'split("\n")[:-1]')"
+
+          pairs_json="$(jq -nc --argjson a "$arches_json" --argjson v "$versions_json" \
+            '[range($a|length) as $i | range($v|length) as $j | {arch:$a[$i],version:$v[$j]}]')"
+
+          {
+            echo "arches=$arches_json"
+            echo "versions=$versions_json"
+            echo "arch_version_pairs=$pairs_json"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Matrix arches: $arches_json"
+          echo "::notice::Matrix versions (latest per major): $versions_json"
+
+      - name: 🔍 Check Extra Package Source Updates
+        id: check-updates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          HASH_TAG="extra-packages-hashes"
+          HASH_ASSET="extra_packages_hashes.json"
+          CURRENT_HASH_FILE="/tmp/current_${HASH_ASSET}"
+          PREVIOUS_HASH_FILE="/tmp/previous_${HASH_ASSET}"
+          UPDATED_ENTRIES_FILE="/tmp/updated_entries.json"
+          DOWNLOAD_DIR="/tmp/hash_release"
+
+          echo '{}' > "$CURRENT_HASH_FILE"
+          echo '{}' > "$UPDATED_ENTRIES_FILE"
+
+          mkdir -p "$DOWNLOAD_DIR"
+          if gh release view "$HASH_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if gh release download "$HASH_TAG" --pattern "$HASH_ASSET" --dir "$DOWNLOAD_DIR" --repo "${{ github.repository }}" --clobber >/dev/null 2>&1; then
+              cp "$DOWNLOAD_DIR/$HASH_ASSET" "$PREVIOUS_HASH_FILE"
+            else
+              echo "{}" > "$PREVIOUS_HASH_FILE"
+            fi
+          else
+            echo "{}" > "$PREVIOUS_HASH_FILE"
+          fi
+
+          jq -S . "$PREVIOUS_HASH_FILE" > "${PREVIOUS_HASH_FILE}.sorted"
+          mv "${PREVIOUS_HASH_FILE}.sorted" "$PREVIOUS_HASH_FILE"
+
+          PAIRS_JSON='${{ steps.collect.outputs.arch_version_pairs }}'
+          pair_count=$(echo "$PAIRS_JSON" | jq 'length')
+          has_updates=false
+          all_updated_packages=()
+
+          for (( idx=0; idx<pair_count; idx++ )); do
+            arch=$(echo "$PAIRS_JSON" | jq -r ".[$idx].arch")
+            version=$(echo "$PAIRS_JSON" | jq -r ".[$idx].version")
+            echo "::notice::🔎 Checking arch=$arch version=$version"
+
+            if [ -f "config/extra_packages.json" ]; then
+              while IFS= read -r entry; do
+                url=$(echo "$entry" | jq -r '.url // empty')
+                branch=$(echo "$entry" | jq -r '.branch // empty')
+                [ -n "$url" ] || continue
+                [ -n "$branch" ] || continue
+
+                remote_hash=$(git ls-remote "$url" "refs/heads/$branch" | awk 'NR==1 {print $1}')
+                if [ -z "$remote_hash" ]; then
+                  echo "::error::Failed to get remote hash for $url@$branch"
+                  exit 1
+                fi
+
+                key="${url}@${branch}"
+                tmp_file="${CURRENT_HASH_FILE}.tmp"
+                jq --arg a "$arch" --arg v "$version" --arg k "$key" --arg h "$remote_hash" \
+                  '.[$a] //= {} | .[$a][$v] //= {} | .[$a][$v][$k] = $h' \
+                  "$CURRENT_HASH_FILE" > "$tmp_file"
+                mv "$tmp_file" "$CURRENT_HASH_FILE"
+
+                previous_hash=$(jq -r --arg a "$arch" --arg v "$version" --arg k "$key" \
+                  '.[$a][$v][$k] // empty' "$PREVIOUS_HASH_FILE")
+
+                if [ "$remote_hash" != "$previous_hash" ]; then
+                  has_updates=true
+                  tmp_file="${UPDATED_ENTRIES_FILE}.tmp"
+                  jq --arg a "$arch" --arg v "$version" --argjson e "$entry" \
+                    '.[$a] //= {} | .[$a][$v] //= [] | .[$a][$v] += [$e]' \
+                    "$UPDATED_ENTRIES_FILE" > "$tmp_file"
+                  mv "$tmp_file" "$UPDATED_ENTRIES_FILE"
+
+                  while IFS= read -r pkg; do
+                    all_updated_packages+=("$pkg")
+                  done < <(echo "$entry" | jq -r '.packages[]?')
+                fi
+
+                echo "📌 $arch/$version: $key -> $remote_hash"
+              done < <(jq -c '.[]' config/extra_packages.json)
+            fi
+          done
+
+          jq -S . "$CURRENT_HASH_FILE" > "${CURRENT_HASH_FILE}.sorted"
+          mv "${CURRENT_HASH_FILE}.sorted" "$CURRENT_HASH_FILE"
+
+          if [ "$has_updates" = "false" ] && ! cmp -s "$CURRENT_HASH_FILE" "$PREVIOUS_HASH_FILE"; then
+            has_updates=true
+          fi
+
+          updated_packages=$(printf '%s\n' "${all_updated_packages[@]}" 2>/dev/null | sort -u | xargs || true)
+          hashes_b64=$(base64 -w 0 "$CURRENT_HASH_FILE")
+          updated_entries_b64=$(base64 -w 0 "$UPDATED_ENTRIES_FILE")
+
+          echo "has_updates=$has_updates" >> $GITHUB_OUTPUT
+          echo "hashes_b64=$hashes_b64" >> $GITHUB_OUTPUT
+          echo "updated_packages=$updated_packages" >> $GITHUB_OUTPUT
+          echo "updated_entries_b64=$updated_entries_b64" >> $GITHUB_OUTPUT
+
+          if [ "$has_updates" = "true" ]; then
+            echo "::notice::✅ Source updates detected, build will run"
+            echo "::notice::📦 Updated packages: ${updated_packages:-<none>}"
+          else
+            echo "::notice::ℹ️ No source updates, build will be skipped"
+          fi
+
+  build_package:
+    name: Build Package ${{ matrix.version }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.has-updates == 'true' && needs.generate-matrix.outputs.updated-packages != ''
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
-    permissions:
-      contents: write
+      matrix:
+        arch: ${{ fromJson(needs.generate-matrix.outputs.arches) }}
+        version: ${{ fromJson(needs.generate-matrix.outputs.versions) }}
+
     steps:
-      - name: 🛬 Checkout Repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: 📅 Get Build Date (CST)
         id: get-date
@@ -71,382 +205,158 @@ jobs:
           build_date=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
           echo "date=$build_date" >> $GITHUB_OUTPUT
 
-      - name: 🔧 Setup Build Environment
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip python3 jq zstd axel coreutils openssl rhash curl dnsutils
-          sudo apt-get install -y libncursesw5-dev genisoimage xsltproc rsync dnsmasq stunnel4 net-tools resolvconf python3-pip python3-venv iptables-persistent qemu-utils
+      # Removed: Extract Major Version (matrix.version is already the major version)
 
-      - name: 📖 Read Device Configuration
-        id: device-config
+      - name: 📦 Clone Extra Packages
+        env:
+          UPDATED_PACKAGES: ${{ needs.generate-matrix.outputs.updated-packages }}
+          UPDATED_ENTRIES_B64: ${{ needs.generate-matrix.outputs.updated-entries-b64 }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ matrix.version }}
         run: |
-          DEVICE="${{ matrix.device }}"
-          CONFIG_FILE="build/${DEVICE}/config.sh"
-          INPUT_IP_ADDRESS="${{ github.event.inputs.ip_address }}"
-          
-          if [ ! -f "$CONFIG_FILE" ]; then
-            echo "::error::Config file not found: $CONFIG_FILE"
-            exit 1
-          fi
-          
-          # Source the config file
-          source "$CONFIG_FILE"
-
-          if [ -n "$INPUT_IP_ADDRESS" ]; then
-            ip_address="$INPUT_IP_ADDRESS"
+          if [ -z "$UPDATED_ENTRIES_B64" ]; then
+            echo "EXTRA_PACKAGES=" >> $GITHUB_ENV
+            echo "::warning::⚠️ No updated entries found"
+            exit 0
           fi
 
-          echo "hostname=$hostname" >> $GITHUB_OUTPUT
-          echo "profile=$profile" >> $GITHUB_OUTPUT
-          echo "targets=$targets" >> $GITHUB_OUTPUT
-          echo "arch=$arch" >> $GITHUB_OUTPUT
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "ip_address=$ip_address" >> $GITHUB_OUTPUT
-          echo "netmask=$netmask" >> $GITHUB_OUTPUT
+          UPDATED_ENTRIES_FILE="/tmp/updated_entries.json"
+          echo "$UPDATED_ENTRIES_B64" | base64 -d > "$UPDATED_ENTRIES_FILE"
 
-          major_version=$(echo "$version" | cut -d. -f1,2)
-          echo "major_version=$major_version" >> $GITHUB_OUTPUT
+          CURRENT_ENTRIES=$(jq -c --arg a "$ARCH" --arg v "$VERSION" \
+            '.[$a][$v] // []' "$UPDATED_ENTRIES_FILE")
+          entry_count=$(echo "$CURRENT_ENTRIES" | jq 'length')
 
-          # Sanitize target (replace / with -)
-          sanitized_target="${targets//\//-}"
-          echo "sanitized_target=$sanitized_target" >> $GITHUB_OUTPUT
-
-          echo "::notice::Device: $profile, Target: $targets, Version: $version"
-
-      - name: 📥 Download ImageBuilder sha256sum
-        id: imagebuilder-sha256
-        run: |
-          VERSION="${{ steps.device-config.outputs.version }}"
-          TARGETS="${{ steps.device-config.outputs.targets }}"
-          BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${TARGETS}"
-          
-          echo "📋 Downloading sha256sums from $BASE_URL"
-          
-          if curl -fsSL "${BASE_URL}/sha256sums" -o /tmp/sha256sums; then
-            echo "✅ Downloaded sha256sums"
-          else
-            echo "::error::Failed to download sha256sums"
-            exit 1
+          if [ "$entry_count" -eq 0 ]; then
+            echo "EXTRA_PACKAGES=" >> $GITHUB_ENV
+            echo "::notice::ℹ️ No updated entries for $ARCH/$VERSION"
+            exit 0
           fi
-          
-          # Extract imagebuilder hash
-          IB_PATTERN="imagebuilder.*(tar\.zst|tar\.xz)"
-          IB_HASH=$(grep -E "$IB_PATTERN" /tmp/sha256sums | head -n1 | awk '{print $1}')
-          
-          if [ -z "$IB_HASH" ]; then
-            echo "::error::Failed to extract imagebuilder hash"
-            exit 1
-          fi
-          
-          echo "ib_hash=$IB_HASH" >> $GITHUB_OUTPUT
-          echo "✅ ImageBuilder sha256: $IB_HASH"
 
-      - name: 💾 Restore ImageBuilder Cache
-        id: cache-restore
-        uses: actions/cache@v5
-        with:
-          path: imagebuilder
-          key: imagebuilder-${{ steps.device-config.outputs.version }}-${{ steps.device-config.outputs.sanitized_target }}-${{ steps.imagebuilder-sha256.outputs.ib_hash }}
+          echo "EXTRA_PACKAGES=$UPDATED_PACKAGES" >> $GITHUB_ENV
+          echo "::notice::📦 Updated packages to build: $UPDATED_PACKAGES"
 
-      - name: 📦 Download ImageBuilder with axel
-        id: download
-        if: steps.cache-restore.outputs.cache-hit != 'true'
-        run: |
-          VERSION="${{ steps.device-config.outputs.version }}"
-          DEVICE_TARGETS="${{ steps.device-config.outputs.targets }}"
-          SANITIZED_TARGET="${{ steps.device-config.outputs.sanitized_target }}"
+          mkdir -p packages
+          echo "$CURRENT_ENTRIES" | jq -c '.[]' | while IFS= read -r entry; do
+            url=$(echo "$entry" | jq -r '.url // empty')
+            branch=$(echo "$entry" | jq -r '.branch // empty')
+            script=$(echo "$entry" | jq -r '.scripts // empty')
+            [ -n "$url" ] || continue
+            [ -n "$branch" ] || continue
 
-          BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${DEVICE_TARGETS}"
-          
-          # Try different filename patterns
-          URLS=(
-            "${BASE_URL}/immortalwrt-imagebuilder-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
-            "${BASE_URL}/immortalwrt-imagebuilder-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
-            "${BASE_URL}/immortalwrt-imagebuilder-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
-            "${BASE_URL}/immortalwrt-imagebuilder-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
-          )
-          
-          mkdir -p imagebuilder_tmp
-          FOUND=0
-          
-          for URL in "${URLS[@]}"; do
-            echo "🔍 Testing: $URL"
-            if curl -Ls --connect-timeout 10 --max-time 30 --head "$URL" -w "%{http_code}" -o /dev/null | grep -q "200"; then
-              echo "✅ Found valid ImageBuilder at: $URL"
-              echo "🚀 Downloading with axel (64 threads)..."
-              
-              if axel -n 64 -o imagebuilder_tmp/imagebuilder.tar.zst "$URL"; then
-                FILESIZE=$(stat -c%s "imagebuilder_tmp/imagebuilder.tar.zst")
-                if [ "$FILESIZE" -gt 1000000 ]; then
-                  echo "✅ Download completed, file size: $FILESIZE bytes"
-                  FOUND=1
-                  break
-                else
-                  echo "⚠️ File too small, trying next URL"
-                fi
-              else
-                echo "⚠️ axel download failed, trying wget as fallback"
-                if wget -O imagebuilder_tmp/imagebuilder.tar.zst "$URL"; then
-                  FILESIZE=$(stat -c%s "imagebuilder_tmp/imagebuilder.tar.zst")
-                  if [ "$FILESIZE" -gt 1000000 ]; then
-                    echo "✅ Wget download completed successfully"
-                    FOUND=1
-                    break
-                  fi
-                fi
-              fi
+            repo_name=$(basename "$url")
+            if [ ! -d "packages/$repo_name" ]; then
+              echo "🔍 Cloning updated source: $url (branch: $branch)"
+              git clone -b "$branch" "$url" "packages/$repo_name"
+              echo "✅ Cloned: $repo_name"
+            fi
+
+            if [ -n "$script" ] && [ -f "scripts/$script" ]; then
+              echo "🔧 Executing script: scripts/$script"
+              bash "scripts/$script"
+              echo "✅ Script executed: $script"
             fi
           done
-          
-          if [ "$FOUND" -eq 0 ]; then
-            echo "::error::ImageBuilder not found at any URL"
-            exit 1
-          fi
 
-      - name: 📦 Extract ImageBuilder
-        if: steps.cache-restore.outputs.cache-hit != 'true'
-        run: |
-          ARCHIVE="imagebuilder_tmp/imagebuilder.tar.zst"
-          
-          if [ ! -f "$ARCHIVE" ]; then
-            echo "::error::Archive not found"
-            exit 1
-          fi
-          
-          mkdir -p extract_tmp
-          cd extract_tmp
-          
-          # Auto-detect archive format
-          if file "$OLDPWD/$ARCHIVE" | grep -q "Zstandard"; then
-            echo "🔧 Extracting Zstandard archive"
-            tar -I zstd -xf "$OLDPWD/$ARCHIVE"
-          elif file "$OLDPWD/$ARCHIVE" | grep -q "XZ"; then
-            echo "🔧 Extracting XZ archive"
-            tar -xJf "$OLDPWD/$ARCHIVE"
-          else
-            echo "⚠️ Unknown format, trying generic extraction"
-            tar -xf "$OLDPWD/$ARCHIVE"
-          fi
-          
-          # Move extracted directory
-          mv immortalwrt-imagebuilder-* ../imagebuilder
-          cd ..
-          rm -rf extract_tmp
-          
-          # Verify
-          if [ ! -f "imagebuilder/Makefile" ]; then
-            echo "::error::ImageBuilder extraction failed"
-            exit 1
-          fi
-          
-          echo "✅ ImageBuilder extracted successfully"
-
-      - name: 📝 Prepare Packages
-        id: packages
+      - name: 🔨 Build OpenWrt Packages
+        uses: sbwml/openwrt-gh-action-sdk@go1.26
         env:
-          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}-openwrt-${{ matrix.version }}
+          FEEDNAME: packages_ci
+          PACKAGES: ${{ needs.generate-matrix.outputs.updated-packages }}
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          MAKEFLAGS: -j$(nproc)
+
+      - name: 🎯 Verify Build Output
         run: |
-          DEVICE="${{ matrix.device }}"
-          DEFAULT_PKG="config/default_packages.sh"
-          DEVICE_PKG="build/${DEVICE}/packages.sh"
-          DEVICE_EXTRA_PKG="build/${DEVICE}/extra_packages.sh"
-          CONFIG_FILE="build/${DEVICE}/config.sh"
-          
-          # Initialize PACKAGES variable
-          PACKAGES=""
-          
-          # Load default packages
-          if [ -f "$DEFAULT_PKG" ]; then
-            echo "📦 Loading default packages from $DEFAULT_PKG"
-            source "$DEFAULT_PKG"
-          fi
-          
-          # Load device-specific packages
-          if [ -f "$DEVICE_PKG" ]; then
-            echo "📦 Loading device-specific packages from $DEVICE_PKG"
-            source "$DEVICE_PKG"
-          fi
-
-          # Load device extra packages
-          if [ -f "$DEVICE_EXTRA_PKG" ]; then
-            # 如果使用了extra_packages.sh，则从release下载预编译的包
-            if [ -f "$CONFIG_FILE" ]; then
-              echo "🔍 Downloading precompiled packages from release"
-              source "$CONFIG_FILE"
-              ARCH="${arch:-unknown}"
-              VERSION="${version:-unknown}"
-              MAJOR_VERSION=$(echo "$VERSION" | cut -d. -f1,2)
-              RELEASE_TAG="${MAJOR_VERSION}-${ARCH}-packages"
-              echo "📥 Downloading packages from release: $RELEASE_TAG"
-              gh release download "$RELEASE_TAG" \
-                --pattern "*.ipk" \
-                --dir "imagebuilder/packages/" \
-                --repo "${{ github.repository }}" || {
-                echo "::warning::⚠️ Could not download packages from release $RELEASE_TAG"
-                echo "Make sure build-openwrt-package.yml has completed for this architecture"
-              }
-              PKG_COUNT=$(find "imagebuilder/packages/" -name "*.ipk" 2>/dev/null | wc -l)
-              if [ "$PKG_COUNT" -gt 0 ]; then
-                echo "✅ Downloaded $PKG_COUNT packages"
-                find "imagebuilder/packages/" -name "*.ipk" -exec ls -lh {} \;
-                # Save ipk list for cleanup before caching
-                find "imagebuilder/packages/" -name "*.ipk" > /tmp/ipk_list.txt
-                echo "📝 Recorded ipk files for later cleanup"
-                source "$DEVICE_EXTRA_PKG"
-              else
-                echo "::warning::⚠️ No packages downloaded, skip sourcing $DEVICE_EXTRA_PKG"
-              fi
-            fi
-          fi
-          
-          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
-          echo "::notice::Total packages: $PACKAGES"
-
-      - name: 📂 Copy Custom Files
-        run: |
-          DEVICE="${{ matrix.device }}"
-          DEVICE_CUSTOM_SH="build/${DEVICE}/99-custom.sh"
-          TARGET_CUSTOM_SH="imagebuilder/files/etc/uci-defaults/99-custom.sh"
-          HOSTNAME="${{ steps.device-config.outputs.hostname }}"
-          IP_ADDRESS="${{ steps.device-config.outputs.ip_address }}"
-          NETMASK="${{ steps.device-config.outputs.netmask }}"
-
-          if [ ! -f "$DEVICE_CUSTOM_SH" ]; then
-            echo "::error::Device custom script not found: $DEVICE_CUSTOM_SH"
+          echo "🔍 Checking build output..."
+          if [ -d "bin/packages/${{ matrix.arch }}/packages_ci" ]; then
+            echo "✅ Found output directory"
+            FILE_COUNT=$(find bin/packages/${{ matrix.arch }}/packages_ci -type f | wc -l)
+            echo "📦 Total files: $FILE_COUNT"
+            find bin/packages/${{ matrix.arch }}/packages_ci -type f -exec ls -lh {} \; | head -10
+          else
+            echo "::error::❌ Output directory not found"
             exit 1
           fi
 
-          mkdir -p imagebuilder/files/etc/uci-defaults
-          cp "$DEVICE_CUSTOM_SH" "$TARGET_CUSTOM_SH"
-
-          if [ -n "$HOSTNAME" ]; then
-            sed -i "s|^hostname=.*|hostname=\"${HOSTNAME}\"|" "$TARGET_CUSTOM_SH"
-          fi
-
-          if [ -n "$IP_ADDRESS" ]; then
-            sed -i "s|^ip_address=.*|ip_address=\"${IP_ADDRESS}\"|" "$TARGET_CUSTOM_SH"
-          fi
-
-          if [ -n "$NETMASK" ]; then
-            sed -i "s|^netmask=.*|netmask=\"${NETMASK}\"|" "$TARGET_CUSTOM_SH"
-          fi
-
-          chmod +x "$TARGET_CUSTOM_SH"
-
-          echo "✅ Copied and patched 99-custom.sh successfully"
-          echo "::notice::Applied network config: ip_address=${IP_ADDRESS}, netmask=${NETMASK}"
-
-      - name: 🔨 Build Firmware
+      - name: 🗑️ Clean Old Remote IPK Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PROFILE="${{ steps.device-config.outputs.profile }}"
-          PACKAGES="${{ steps.packages.outputs.packages }}"
+          RELEASE_TAG="${{ matrix.version }}-${{ matrix.arch }}"
+          PKG_DIR="bin/packages/${{ matrix.arch }}/packages_ci"
           
-          cd imagebuilder
+          echo "📋 Checking for old remote assets in release: $RELEASE_TAG"
           
-          echo "🚀 Building with PROFILE=$PROFILE"
-          echo "📦 Packages: $PACKAGES"
-          echo "🔄 Using $(nproc) parallel jobs"
+          # 检查 release 是否存在，并获取资产列表
+          if ! gh release view "$RELEASE_TAG" &>/dev/null; then
+            echo "ℹ️ Release does not exist yet, skipping cleanup"
+            exit 0
+          fi
           
-          if ! make -j$(nproc) image PROFILE="$PROFILE" PACKAGES="$PACKAGES" FILES="files/" V=s; then
-            echo "::error::Build failed"
+          # 获取远程 release 资产列表
+          gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' > /tmp/remote_assets.txt || true
+          
+          # 遍历本地所有 ipk 文件
+          for ipk in "$PKG_DIR"/*.ipk; do
+            [ -e "$ipk" ] || continue
+            base=$(basename "$ipk")
+            # 提取包名（下划线前的部分）
+            prefix=${base%%_*}
             
-            # Collect error logs
-            if [ -d "logs" ]; then
-              echo "::error::Build errors:"
-              grep -i 'error\|failed' logs/*.log | head -20 || true
-            fi
-            exit 1
-          fi
-          
-          echo "✅ Build completed successfully"
-
-      - name: 🗜️ Archive Artifacts
-        run: |
-          PROFILE="${{ steps.device-config.outputs.profile }}"
-          ARTIFACT_DIR="artifacts/${PROFILE}"
-          ARCH_SEGMENT="${{ steps.device-config.outputs.sanitized_target }}-"
-
-          mkdir -p "$ARTIFACT_DIR"
-
-          echo "🔍 Collecting build outputs from imagebuilder/bin/targets"
-          mapfile -t FIRMWARE_FILES < <(find imagebuilder/bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \))
-
-          if [ "${#FIRMWARE_FILES[@]}" -eq 0 ]; then
-            echo "::error::No firmware artifacts found under imagebuilder/bin/targets"
-            find imagebuilder/bin/targets -maxdepth 4 -type d -print || true
-            exit 1
-          fi
-
-          for file in "${FIRMWARE_FILES[@]}"; do
-            filename="$(basename "$file")"
-            cleaned_name="${filename#immortalwrt-}"
-            cleaned_name="${cleaned_name//${ARCH_SEGMENT}/}"
-            cp "$file" "$ARTIFACT_DIR/$cleaned_name"
-            echo "📦 $filename -> $cleaned_name"
+            # 查找远程所有同包名但不同文件名的 ipk，并删除
+            grep "^${prefix}_" /tmp/remote_assets.txt | grep -v "^${base}$" | while read old_asset; do
+              echo "🗑️ Deleting old asset: $old_asset"
+              gh release delete-asset "$RELEASE_TAG" "$old_asset" -y 2>/dev/null || echo "⚠️ Failed to delete: $old_asset"
+            done
           done
-
-          echo "✅ Archived ${#FIRMWARE_FILES[@]} files to $ARTIFACT_DIR"
-
-      - name: 🧹 Clean Downloaded IPK & Firmware Before Cache
-        if: always()
-        run: |
-          # 删除下载的 ipk
-          if [ -f /tmp/ipk_list.txt ]; then
-            echo "🧹 Removing downloaded ipk files before caching..."
-            xargs rm -f < /tmp/ipk_list.txt
-            echo "✅ Cleaned downloaded ipk files"
-          fi
-          # 删除 imagebuilder/bin 下所有固件文件
-          if [ -d imagebuilder/bin ]; then
-            echo "🧹 Removing built firmware files in imagebuilder/bin ..."
-            find imagebuilder/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \) -exec rm -f {} +
-            echo "✅ Cleaned firmware files in imagebuilder/bin"
-          fi
-
-      - name: 🗑️ Delete Old Release & Tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RELEASE_TAG="${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}"
           
-          echo "🔍 Checking for existing release: $RELEASE_TAG"
-          
-          # 检查release是否存在
-          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            echo "🗑️ Deleting old release: $RELEASE_TAG"
-            gh release delete "$RELEASE_TAG" --repo "${{ github.repository }}" --yes
-            echo "✅ Release deleted"
-          else
-            echo "ℹ️ No existing release found"
-          fi
-          
-          # 删除对应的tag
-          if git rev-parse "$RELEASE_TAG" &>/dev/null; then
-            echo "🗑️ Deleting old tag: $RELEASE_TAG"
-            git tag -d "$RELEASE_TAG"
-            git push --delete origin "$RELEASE_TAG" 2>/dev/null || echo "⚠️ Could not delete remote tag (may not exist)"
-            echo "✅ Tag deleted"
-          fi
+          echo "✅ Cleanup completed"
 
       - name: 🚀 Upload to Release
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          files: artifacts/${{ steps.device-config.outputs.profile }}/*
-          tag_name: ${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}
-          name: 📤 ${{ steps.device-config.outputs.major_version }} ${{ matrix.device }}
+          files: bin/packages/${{ matrix.arch }}/packages_ci/*
+          tag_name: ${{ matrix.version }}-${{ matrix.arch }}-packages
+          name: 📦 ${{ matrix.version }} ${{ matrix.arch }} Packages
           body: |
             ### 📋 Build Information
 
             **Build ID**: `${{ github.run_id }}`
             **Build Date**: `${{ steps.get-date.outputs.date }}`
 
-            ### 🔧 Firmware Information
+            ### 📦 Package Information
 
-            **Profile**: `${{ steps.device-config.outputs.profile }}`
-            **Architecture**: `${{ steps.device-config.outputs.arch }}`
-            **Target**: `${{ steps.device-config.outputs.targets }}`
-            **SDK Version**: `${{ steps.device-config.outputs.version }}`
-            **IP Address**: `${{ steps.device-config.outputs.ip_address || '192.168.1.1' }}`
+            **Architecture**: `${{ matrix.arch }}`
+            **SDK Version**: `${{ matrix.version }}`
+
+  update-hash-release:
+    name: Update Source Hash Release
+    runs-on: ubuntu-latest
+    needs:
+      - generate-matrix
+      - build_package
+    if: needs.generate-matrix.outputs.has-updates == 'true' && needs.build_package.result == 'success'
+    steps:
+      - name: 📄 Restore Hash File
+        run: |
+          HASH_FILE="extra_packages_hashes.json"
+          echo '${{ needs.generate-matrix.outputs.hashes-b64 }}' | base64 -d > "$HASH_FILE"
+          echo "✅ Restored hash file"
+          jq . "$HASH_FILE"
+
+      - name: 📤 Upload Hash File to Dedicated Release
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: extra-packages-hashes
+          name: Extra Packages Hashes
+          body: |
+            This release stores source branch hashes for extra packages.
+          files: extra_packages_hashes.json
           draft: false
           prerelease: false
+          overwrite_files: true
