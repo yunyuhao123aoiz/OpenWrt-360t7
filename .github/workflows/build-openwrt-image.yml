@@ -1,71 +1,170 @@
-name: Build Custom Packages
+name: Build OpenWrt Image
 
 on:
-  workflow_call:
-    # 无输入参数，自包含
+  workflow_dispatch:
+    inputs:
+      device:
+        type: choice
+        description: "选择型号"
+        required: true
+        default: all
+        options:
+          - qihoo_360t7
+      ip_address:
+        type: string
+        description: "后台IP地址(可选)"
+        required: false
 
 jobs:
-  build-packages:
+  generate-matrix:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: 🛬 Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: 🧩 Build Matrix
+        id: set-matrix
+        run: |
+          SELECTED_DEVICE="${{ github.event.inputs.device }}"
+
+          if [ "$SELECTED_DEVICE" = "all" ]; then
+            mapfile -t DEVICES < <(find build -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/config.sh' ';' -printf '%f\n' | sort)
+          else
+            DEVICES=("$SELECTED_DEVICE")
+          fi
+
+          if [ "${#DEVICES[@]}" -eq 0 ]; then
+            echo "::error::No build devices found under build/"
+            exit 1
+          fi
+
+          MATRIX_JSON=$(printf '%s\n' "${DEVICES[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({device: .}) | {include: .}')
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "::notice::Build matrix: $MATRIX_JSON"
+
+  call-build-package:
+    uses: ./.github/workflows/build-openwrt-package.yml
+    secrets: inherit
+    permissions:
+      contents: write
+
+  build:
+    needs:
+      - generate-matrix
+      - call-build-package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     permissions:
       contents: write
     steps:
       - name: 🛬 Checkout Repository
         uses: actions/checkout@v6
 
-      - name: 📖 Read Configuration
-        id: config
+      - name: 📅 Get Build Date (CST)
+        id: get-date
         run: |
-          # 读取设备配置（假设第一个设备，或直接指定 qihoo_360t7）
-          DEVICE_CONFIG="build/qihoo_360t7/config.sh"
-          if [ ! -f "$DEVICE_CONFIG" ]; then
-            echo "::error::Device config not found: $DEVICE_CONFIG"
-            exit 1
-          fi
-          source "$DEVICE_CONFIG"
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "arch=$arch" >> $GITHUB_OUTPUT
-          echo "targets=$targets" >> $GITHUB_OUTPUT
-
-          # 读取包列表
-          PACKAGE_CONFIG="build/package/config.sh"
-          if [ ! -f "$PACKAGE_CONFIG" ]; then
-            echo "::error::Package config not found: $PACKAGE_CONFIG"
-            exit 1
-          fi
-          source "$PACKAGE_CONFIG"
-          echo "packages=$PACKAGES_TO_BUILD" >> $GITHUB_OUTPUT
+          TZ='Asia/Shanghai'
+          build_date=$(TZ=$TZ date +'%Y-%m-%d %H:%M:%S %Z')
+          echo "date=$build_date" >> $GITHUB_OUTPUT
 
       - name: 🔧 Setup Build Environment
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip python3 jq zstd axel coreutils openssl rhash curl
-          sudo apt-get install -y libncursesw5-dev genisoimage xsltproc rsync
+          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip python3 jq zstd axel coreutils openssl rhash curl dnsutils
+          sudo apt-get install -y libncursesw5-dev genisoimage xsltproc rsync dnsmasq stunnel4 net-tools resolvconf python3-pip python3-venv iptables-persistent qemu-utils
 
-      - name: 📥 Download SDK
-        id: download-sdk
+      - name: 📖 Read Device Configuration
+        id: device-config
         run: |
-          VERSION="${{ steps.config.outputs.version }}"
-          TARGETS="${{ steps.config.outputs.targets }}"
-          SANITIZED_TARGET="${TARGETS//\//-}"
+          DEVICE="${{ matrix.device }}"
+          CONFIG_FILE="build/${DEVICE}/config.sh"
+          INPUT_IP_ADDRESS="${{ github.event.inputs.ip_address }}"
+          
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::Config file not found: $CONFIG_FILE"
+            exit 1
+          fi
+          
+          source "$CONFIG_FILE"
+
+          if [ -n "$INPUT_IP_ADDRESS" ]; then
+            ip_address="$INPUT_IP_ADDRESS"
+          fi
+
+          echo "hostname=$hostname" >> $GITHUB_OUTPUT
+          echo "profile=$profile" >> $GITHUB_OUTPUT
+          echo "targets=$targets" >> $GITHUB_OUTPUT
+          echo "arch=$arch" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "ip_address=$ip_address" >> $GITHUB_OUTPUT
+          echo "netmask=$netmask" >> $GITHUB_OUTPUT
+
+          major_version=$(echo "$version" | cut -d. -f1,2)
+          echo "major_version=$major_version" >> $GITHUB_OUTPUT
+
+          sanitized_target="${targets//\//-}"
+          echo "sanitized_target=$sanitized_target" >> $GITHUB_OUTPUT
+
+          echo "::notice::Device: $profile, Target: $targets, Version: $version"
+
+      - name: 📥 Download ImageBuilder sha256sum
+        id: imagebuilder-sha256
+        run: |
+          VERSION="${{ steps.device-config.outputs.version }}"
+          TARGETS="${{ steps.device-config.outputs.targets }}"
           BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${TARGETS}"
           
+          if curl -fsSL "${BASE_URL}/sha256sums" -o /tmp/sha256sums; then
+            echo "✅ Downloaded sha256sums"
+          else
+            echo "::error::Failed to download sha256sums"
+            exit 1
+          fi
+          
+          IB_HASH=$(grep -E "imagebuilder.*(tar\.zst|tar\.xz)" /tmp/sha256sums | head -n1 | awk '{print $1}')
+          if [ -z "$IB_HASH" ]; then
+            echo "::error::Failed to extract imagebuilder hash"
+            exit 1
+          fi
+          echo "ib_hash=$IB_HASH" >> $GITHUB_OUTPUT
+          echo "✅ ImageBuilder sha256: $IB_HASH"
+
+      - name: 💾 Restore ImageBuilder Cache
+        id: cache-restore
+        uses: actions/cache@v5
+        with:
+          path: imagebuilder
+          key: imagebuilder-${{ steps.device-config.outputs.version }}-${{ steps.device-config.outputs.sanitized_target }}-${{ steps.imagebuilder-sha256.outputs.ib_hash }}
+
+      - name: 📦 Download ImageBuilder with axel
+        id: download
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          VERSION="${{ steps.device-config.outputs.version }}"
+          DEVICE_TARGETS="${{ steps.device-config.outputs.targets }}"
+          SANITIZED_TARGET="${{ steps.device-config.outputs.sanitized_target }}"
+
+          BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${DEVICE_TARGETS}"
+          
           URLS=(
-            "${BASE_URL}/immortalwrt-sdk-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
-            "${BASE_URL}/immortalwrt-sdk-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
-            "${BASE_URL}/immortalwrt-sdk-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
-            "${BASE_URL}/immortalwrt-sdk-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
+            "${BASE_URL}/immortalwrt-imagebuilder-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
+            "${BASE_URL}/immortalwrt-imagebuilder-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
+            "${BASE_URL}/immortalwrt-imagebuilder-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
+            "${BASE_URL}/immortalwrt-imagebuilder-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
           )
           
-          mkdir -p sdk_tmp
+          mkdir -p imagebuilder_tmp
           FOUND=0
           for URL in "${URLS[@]}"; do
             echo "🔍 Testing: $URL"
             if curl -Ls --connect-timeout 10 --max-time 30 --head "$URL" -w "%{http_code}" -o /dev/null | grep -q "200"; then
-              echo "✅ Found SDK at: $URL"
-              echo "🚀 Downloading with axel..."
-              if axel -n 64 -o sdk_tmp/sdk.tar.zst "$URL"; then
-                FILESIZE=$(stat -c%s "sdk_tmp/sdk.tar.zst")
+              echo "✅ Found valid ImageBuilder at: $URL"
+              if axel -n 64 -o imagebuilder_tmp/imagebuilder.tar.zst "$URL"; then
+                FILESIZE=$(stat -c%s "imagebuilder_tmp/imagebuilder.tar.zst")
                 if [ "$FILESIZE" -gt 1000000 ]; then
                   FOUND=1
                   break
@@ -74,62 +173,160 @@ jobs:
             fi
           done
           if [ "$FOUND" -eq 0 ]; then
-            echo "::error::SDK not found"
+            echo "::error::ImageBuilder not found at any URL"
             exit 1
           fi
-          echo "✅ SDK downloaded"
 
-      - name: 📦 Extract SDK
+      - name: 📦 Extract ImageBuilder
+        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: |
+          ARCHIVE="imagebuilder_tmp/imagebuilder.tar.zst"
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "::error::Archive not found"
+            exit 1
+          fi
           mkdir -p extract_tmp
           cd extract_tmp
-          if file "$OLDPWD/sdk_tmp/sdk.tar.zst" | grep -q "Zstandard"; then
-            tar -I zstd -xf "$OLDPWD/sdk_tmp/sdk.tar.zst"
-          elif file "$OLDPWD/sdk_tmp/sdk.tar.zst" | grep -q "XZ"; then
-            tar -xJf "$OLDPWD/sdk_tmp/sdk.tar.zst"
+          if file "$OLDPWD/$ARCHIVE" | grep -q "Zstandard"; then
+            tar -I zstd -xf "$OLDPWD/$ARCHIVE"
+          elif file "$OLDPWD/$ARCHIVE" | grep -q "XZ"; then
+            tar -xJf "$OLDPWD/$ARCHIVE"
           else
-            tar -xf "$OLDPWD/sdk_tmp/sdk.tar.zst"
+            tar -xf "$OLDPWD/$ARCHIVE"
           fi
-          mv immortalwrt-sdk-* ../sdk
+          mv immortalwrt-imagebuilder-* ../imagebuilder
           cd ..
-          rm -rf extract_tmp sdk_tmp
-          echo "✅ SDK extracted"
+          rm -rf extract_tmp
+          if [ ! -f "imagebuilder/Makefile" ]; then
+            echo "::error::ImageBuilder extraction failed"
+            exit 1
+          fi
+          echo "✅ ImageBuilder extracted successfully"
 
-      - name: 📦 Add Custom Feeds
-        run: |
-          cd sdk
-          # 添加自定义 feed（可根据需要追加更多）
-          echo "src-git timecontrol https://github.com/TimouL/luci-app-timecontrol.git" >> feeds.conf.default
-          # 如果还有其他 feed，在这里添加
-          # echo "src-git openclash https://github.com/vernesong/OpenClash.git" >> feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: 🔨 Compile Packages
-        run: |
-          cd sdk
-          PACKAGES="${{ steps.config.outputs.packages }}"
-          for PKG in $PACKAGES; do
-            echo "🔨 Building package: $PKG"
-            make package/$PKG/compile V=s || {
-              echo "::error::Failed to build $PKG"
-              exit 1
-            }
-          done
-
-      - name: 📦 Collect IPK Files
-        run: |
-          mkdir -p ipk_output
-          find sdk/bin -name "*.ipk" -exec cp {} ipk_output/ \;
-          echo "✅ Collected $(ls ipk_output/*.ipk 2>/dev/null | wc -l) packages"
-
-      - name: 🗑️ Delete Old Package Release
+      - name: 📝 Prepare Packages
+        id: packages
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          RELEASE_TAG="${{ steps.config.outputs.version }}-${{ steps.config.outputs.arch }}-packages"
+          DEVICE="${{ matrix.device }}"
+          DEFAULT_PKG="config/default_packages.sh"
+          DEVICE_PKG="build/${DEVICE}/packages.sh"
+          DEVICE_EXTRA_PKG="build/${DEVICE}/extra_packages.sh"
+          CONFIG_FILE="build/${DEVICE}/config.sh"
+          
+          PACKAGES=""
+          if [ -f "$DEFAULT_PKG" ]; then
+            source "$DEFAULT_PKG"
+          fi
+          if [ -f "$DEVICE_PKG" ]; then
+            source "$DEVICE_PKG"
+          fi
+          if [ -f "$DEVICE_EXTRA_PKG" ]; then
+            if [ -f "$CONFIG_FILE" ]; then
+              echo "🔍 Downloading precompiled packages from release"
+              source "$CONFIG_FILE"
+              MAJOR_VERSION=$(echo "$version" | cut -d. -f1,2)
+              RELEASE_TAG="${MAJOR_VERSION}-${arch}-packages"
+              gh release download "$RELEASE_TAG" \
+                --pattern "*.ipk" \
+                --dir "imagebuilder/packages/" \
+                --repo "${{ github.repository }}" || {
+                echo "::warning::⚠️ Could not download packages from release $RELEASE_TAG"
+              }
+              PKG_COUNT=$(find "imagebuilder/packages/" -name "*.ipk" 2>/dev/null | wc -l)
+              if [ "$PKG_COUNT" -gt 0 ]; then
+                echo "✅ Downloaded $PKG_COUNT packages"
+                find "imagebuilder/packages/" -name "*.ipk" > /tmp/ipk_list.txt
+                source "$DEVICE_EXTRA_PKG"
+              else
+                echo "::warning::⚠️ No packages downloaded, skip sourcing $DEVICE_EXTRA_PKG"
+              fi
+            fi
+          fi
+          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+          echo "::notice::Total packages: $PACKAGES"
+
+      - name: 📂 Copy Custom Files
+        run: |
+          DEVICE="${{ matrix.device }}"
+          DEVICE_CUSTOM_SH="build/${DEVICE}/99-custom.sh"
+          TARGET_CUSTOM_SH="imagebuilder/files/etc/uci-defaults/99-custom.sh"
+          HOSTNAME="${{ steps.device-config.outputs.hostname }}"
+          IP_ADDRESS="${{ steps.device-config.outputs.ip_address }}"
+          NETMASK="${{ steps.device-config.outputs.netmask }}"
+
+          if [ ! -f "$DEVICE_CUSTOM_SH" ]; then
+            echo "::error::Device custom script not found: $DEVICE_CUSTOM_SH"
+            exit 1
+          fi
+
+          mkdir -p imagebuilder/files/etc/uci-defaults
+          cp "$DEVICE_CUSTOM_SH" "$TARGET_CUSTOM_SH"
+
+          if [ -n "$HOSTNAME" ]; then
+            sed -i "s|^hostname=.*|hostname=\"${HOSTNAME}\"|" "$TARGET_CUSTOM_SH"
+          fi
+          if [ -n "$IP_ADDRESS" ]; then
+            sed -i "s|^ip_address=.*|ip_address=\"${IP_ADDRESS}\"|" "$TARGET_CUSTOM_SH"
+          fi
+          if [ -n "$NETMASK" ]; then
+            sed -i "s|^netmask=.*|netmask=\"${NETMASK}\"|" "$TARGET_CUSTOM_SH"
+          fi
+
+          chmod +x "$TARGET_CUSTOM_SH"
+          echo "✅ Copied and patched 99-custom.sh successfully"
+
+      - name: 🔨 Build Firmware
+        run: |
+          PROFILE="${{ steps.device-config.outputs.profile }}"
+          PACKAGES="${{ steps.packages.outputs.packages }}"
+          cd imagebuilder
+          echo "🚀 Building with PROFILE=$PROFILE"
+          echo "📦 Packages: $PACKAGES"
+          if ! make -j$(nproc) image PROFILE="$PROFILE" PACKAGES="$PACKAGES" FILES="files/" V=s; then
+            echo "::error::Build failed"
+            if [ -d "logs" ]; then
+              grep -i 'error\|failed' logs/*.log | head -20 || true
+            fi
+            exit 1
+          fi
+          echo "✅ Build completed successfully"
+
+      - name: 🗜️ Archive Artifacts
+        run: |
+          PROFILE="${{ steps.device-config.outputs.profile }}"
+          ARTIFACT_DIR="artifacts/${PROFILE}"
+          ARCH_SEGMENT="${{ steps.device-config.outputs.sanitized_target }}-"
+          mkdir -p "$ARTIFACT_DIR"
+          mapfile -t FIRMWARE_FILES < <(find imagebuilder/bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \))
+          if [ "${#FIRMWARE_FILES[@]}" -eq 0 ]; then
+            echo "::error::No firmware artifacts found"
+            exit 1
+          fi
+          for file in "${FIRMWARE_FILES[@]}"; do
+            filename="$(basename "$file")"
+            cleaned_name="${filename#immortalwrt-}"
+            cleaned_name="${cleaned_name//${ARCH_SEGMENT}/}"
+            cp "$file" "$ARTIFACT_DIR/$cleaned_name"
+          done
+          echo "✅ Archived ${#FIRMWARE_FILES[@]} files"
+
+      - name: 🧹 Clean Downloaded IPK & Firmware Before Cache
+        if: always()
+        run: |
+          if [ -f /tmp/ipk_list.txt ]; then
+            xargs rm -f < /tmp/ipk_list.txt
+          fi
+          if [ -d imagebuilder/bin ]; then
+            find imagebuilder/bin -type f \( -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \) -exec rm -f {} +
+          fi
+
+      - name: 🗑️ Delete Old Release & Tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_TAG="${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}"
           if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            echo "🗑️ Deleting old package release: $RELEASE_TAG"
             gh release delete "$RELEASE_TAG" --repo "${{ github.repository }}" --yes
           fi
           if git rev-parse "$RELEASE_TAG" &>/dev/null; then
@@ -137,15 +334,22 @@ jobs:
             git push --delete origin "$RELEASE_TAG" 2>/dev/null || true
           fi
 
-      - name: 🚀 Upload Packages to Release
+      - name: 🚀 Upload to Release
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          files: ipk_output/*.ipk
-          tag_name: ${{ steps.config.outputs.version }}-${{ steps.config.outputs.arch }}-packages
-          name: 📦 ${{ steps.config.outputs.version }} ${{ steps.config.outputs.arch }} Packages
+          files: artifacts/${{ steps.device-config.outputs.profile }}/*
+          tag_name: ${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}
+          name: 📤 ${{ steps.device-config.outputs.major_version }} ${{ matrix.device }}
           body: |
-            **Pre-compiled packages for ${{ steps.config.outputs.arch }}**
-            Built from feeds at commit ${{ github.sha }}
+            ### 📋 Build Information
+            **Build ID**: `${{ github.run_id }}`
+            **Build Date**: `${{ steps.get-date.outputs.date }}`
+            ### 🔧 Firmware Information
+            **Profile**: `${{ steps.device-config.outputs.profile }}`
+            **Architecture**: `${{ steps.device-config.outputs.arch }}`
+            **Target**: `${{ steps.device-config.outputs.targets }}`
+            **SDK Version**: `${{ steps.device-config.outputs.version }}`
+            **IP Address**: `${{ steps.device-config.outputs.ip_address || '192.168.1.1' }}`
           draft: false
           prerelease: false
