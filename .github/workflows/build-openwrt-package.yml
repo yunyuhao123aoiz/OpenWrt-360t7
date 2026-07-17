@@ -2,7 +2,6 @@ name: Build Custom Packages
 
 on:
   workflow_call:
-    # 无输入参数，自包含
 
 jobs:
   build-packages:
@@ -16,7 +15,6 @@ jobs:
       - name: 📖 Read Configuration
         id: config
         run: |
-          # 读取设备配置（假设第一个设备，或直接指定 qihoo_360t7）
           DEVICE_CONFIG="build/qihoo_360t7/config.sh"
           if [ ! -f "$DEVICE_CONFIG" ]; then
             echo "::error::Device config not found: $DEVICE_CONFIG"
@@ -27,7 +25,6 @@ jobs:
           echo "arch=$arch" >> $GITHUB_OUTPUT
           echo "targets=$targets" >> $GITHUB_OUTPUT
 
-          # 读取包列表
           PACKAGE_CONFIG="build/package/config.sh"
           if [ ! -f "$PACKAGE_CONFIG" ]; then
             echo "::error::Package config not found: $PACKAGE_CONFIG"
@@ -47,48 +44,41 @@ jobs:
         run: |
           VERSION="${{ steps.config.outputs.version }}"
           TARGETS="${{ steps.config.outputs.targets }}"
-          SANITIZED_TARGET="${TARGETS//\//-}"
           BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${TARGETS}"
           
-          URLS=(
-            "${BASE_URL}/immortalwrt-sdk-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
-            "${BASE_URL}/immortalwrt-sdk-${SANITIZED_TARGET}.Linux-x86_64.tar.zst"
-            "${BASE_URL}/immortalwrt-sdk-${VERSION}-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
-            "${BASE_URL}/immortalwrt-sdk-${SANITIZED_TARGET}.Linux-x86_64.tar.xz"
-          )
+          echo "📋 Downloading sha256sums from $BASE_URL"
+          curl -fsSL "${BASE_URL}/sha256sums" -o /tmp/sha256sums || {
+            echo "::error::Failed to download sha256sums"
+            exit 1
+          }
           
-          mkdir -p sdk_tmp
-          FOUND=0
-          for URL in "${URLS[@]}"; do
-            echo "🔍 Testing: $URL"
-            if curl -Ls --connect-timeout 10 --max-time 30 --head "$URL" -w "%{http_code}" -o /dev/null | grep -q "200"; then
-              echo "✅ Found SDK at: $URL"
-              echo "🚀 Downloading with axel..."
-              if axel -n 64 -o sdk_tmp/sdk.tar.zst "$URL"; then
-                FILESIZE=$(stat -c%s "sdk_tmp/sdk.tar.zst")
-                if [ "$FILESIZE" -gt 1000000 ]; then
-                  FOUND=1
-                  break
-                fi
-              fi
-            fi
-          done
-          if [ "$FOUND" -eq 0 ]; then
-            echo "::error::SDK not found"
+          SDK_FILE=$(grep -E 'sdk.*\.(tar\.zst|tar\.xz)' /tmp/sha256sums | head -n1 | awk '{print $2}')
+          if [ -z "$SDK_FILE" ]; then
+            echo "::error::SDK file not found in sha256sums"
             exit 1
           fi
-          echo "✅ SDK downloaded"
+          echo "🔍 Found SDK file: $SDK_FILE"
+          
+          echo "🚀 Downloading SDK with axel..."
+          mkdir -p sdk_tmp
+          if axel -n 64 -o "sdk_tmp/$SDK_FILE" "${BASE_URL}/${SDK_FILE}"; then
+            echo "✅ SDK downloaded"
+          else
+            echo "::error::Failed to download SDK"
+            exit 1
+          fi
 
       - name: 📦 Extract SDK
         run: |
+          SDK_FILE=$(ls sdk_tmp/)
           mkdir -p extract_tmp
           cd extract_tmp
-          if file "$OLDPWD/sdk_tmp/sdk.tar.zst" | grep -q "Zstandard"; then
-            tar -I zstd -xf "$OLDPWD/sdk_tmp/sdk.tar.zst"
-          elif file "$OLDPWD/sdk_tmp/sdk.tar.zst" | grep -q "XZ"; then
-            tar -xJf "$OLDPWD/sdk_tmp/sdk.tar.zst"
+          if file "$OLDPWD/sdk_tmp/$SDK_FILE" | grep -q "Zstandard"; then
+            tar -I zstd -xf "$OLDPWD/sdk_tmp/$SDK_FILE"
+          elif file "$OLDPWD/sdk_tmp/$SDK_FILE" | grep -q "XZ"; then
+            tar -xJf "$OLDPWD/sdk_tmp/$SDK_FILE"
           else
-            tar -xf "$OLDPWD/sdk_tmp/sdk.tar.zst"
+            tar -xf "$OLDPWD/sdk_tmp/$SDK_FILE"
           fi
           mv immortalwrt-sdk-* ../sdk
           cd ..
@@ -98,10 +88,8 @@ jobs:
       - name: 📦 Add Custom Feeds
         run: |
           cd sdk
-          # 添加自定义 feed（可根据需要追加更多）
           echo "src-git timecontrol https://github.com/TimouL/luci-app-timecontrol.git" >> feeds.conf.default
-          # 如果还有其他 feed，在这里添加
-          # echo "src-git openclash https://github.com/vernesong/OpenClash.git" >> feeds.conf.default
+          # 如需其他 feed，在此追加
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
