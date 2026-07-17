@@ -21,9 +21,9 @@
     "branch": "main",
     "packages": ["luci-app-timecontrol", "luci-i18n-timecontrol-zh-cn"]
   },
-  {
-    "url": "https://github.com/destan19/OpenAppFilter.git",
-    "branch": "main",
-    "packages": ["kmod-oaf", "luci-app-oaf", "luci-i18n-oaf-zh-cn"]
-  }
+{
+  "url": "https://github.com/destan19/OpenAppFilter",
+  "branch": "main",
+  "packages": ["kmod-oaf", "appfilter", "luci-app-oaf", "luci-i18n-oaf-zh-cn"]
+}
 ]
