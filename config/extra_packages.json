@@ -19,7 +19,7 @@
   {
     "url": "https://github.com/TimouL/luci-app-timecontrol.git",
     "branch": "main",
-    "packages": ["luci-app-timecontrol", "luci-i18n-timecontrol-zh-cn"]
+    "packages": ["luci-app-timecontrol"]
   },
   {
     "url": "https://github.com/destan19/OpenAppFilter",
