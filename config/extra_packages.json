@@ -24,6 +24,6 @@
   {
     "url": "https://github.com/destan19/OpenAppFilter",
     "branch": "master",
-    "packages": ["kmod-oaf", "appfilter", "luci-app-oaf", "luci-i18n-oaf-zh-cn"]
+    "packages": ["luci-app-oaf"]
   }
 ]
