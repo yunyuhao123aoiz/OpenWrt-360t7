@@ -59,13 +59,18 @@ jobs:
           fi
           echo "🔍 Found SDK file: $SDK_FILE"
           
-          echo "🚀 Downloading SDK with axel..."
+          echo "🚀 Downloading SDK with curl..."
           mkdir -p sdk_tmp
-          if axel -n 64 -o "sdk_tmp/$SDK_FILE" "${BASE_URL}/${SDK_FILE}"; then
-            echo "✅ SDK downloaded"
+          if curl -L --fail -o "sdk_tmp/$SDK_FILE" "${BASE_URL}/${SDK_FILE}"; then
+            echo "✅ SDK downloaded via curl"
           else
-            echo "::error::Failed to download SDK"
-            exit 1
+            echo "⚠️ curl download failed, trying wget as fallback..."
+            if wget -O "sdk_tmp/$SDK_FILE" "${BASE_URL}/${SDK_FILE}"; then
+              echo "✅ SDK downloaded via wget"
+            else
+              echo "::error::Failed to download SDK via both curl and wget"
+              exit 1
+            fi
           fi
 
       - name: 📦 Extract SDK
