@@ -7,7 +7,5 @@ PACKAGES="$PACKAGES \
     luci-app-mosdns \
     luci-app-timecontrol \
     luci-i18n-timecontrol-zh-cn \
-    kmod-oaf \
-    appfilter \
     luci-app-oaf \
-    luci-i18n-oaf-zh-cn"
+
